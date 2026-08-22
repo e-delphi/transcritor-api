@@ -1,0 +1,13 @@
+# Stack da API: transcrição + diarização offline, sem token HuggingFace.
+# torch/torchaudio vêm do índice CPU (ver Dockerfile) para manter a imagem enxuta.
+fastapi==0.115.6
+uvicorn[standard]==0.32.1
+python-multipart==0.0.20
+faster-whisper==1.1.1
+# A .so publicada vem marcada com executable stack, que kernels recentes (WSL2
+# incluso) recusam carregar; docker/fix_execstack.py limpa isso durante o build.
+ctranslate2==4.4.0
+speechbrain==1.0.2
+scikit-learn==1.5.2
+numpy==1.26.4
+huggingface_hub==0.26.5

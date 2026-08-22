@@ -1,0 +1,16 @@
+services:
+  transcritor-api:
+    build:
+      context: .
+      args:
+        # tiny | base | small | medium | large-v2 | large-v3
+        WHISPER_MODEL: ${WHISPER_MODEL:-large-v3}
+    image: transcritor-api:latest
+    container_name: transcritor-api
+    ports:
+      - "8000:8000"
+    environment:
+      COMPUTE_TYPE: int8
+      OMP_NUM_THREADS: 8
+      MAX_UPLOAD_MB: 512
+    restart: unless-stopped

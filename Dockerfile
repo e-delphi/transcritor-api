@@ -25,7 +25,7 @@ RUN python -m venv /opt/venv
 # Modelos primeiro: assim mexer nas dependências não refaz o download.
 # Ambos os repositórios são públicos e não-gated — nenhum token é necessário.
 ENV WHISPER_MODEL_DIR=/models/whisper \
-    ECAPA_MODEL_DIR=/models/ecapa
+    EMBEDDER_MODEL_DIR=/models/embedder
 COPY docker/download_models.py /tmp/download_models.py
 RUN pip install --no-cache-dir huggingface_hub==0.26.5 \
  && WHISPER_MODEL=${WHISPER_MODEL} python /tmp/download_models.py
@@ -44,7 +44,7 @@ COPY docker/fix_execstack.py /tmp/fix_execstack.py
 RUN python /tmp/fix_execstack.py /opt/venv
 
 # Falha o build (em vez do runtime) se alguma extensão nativa não carregar.
-RUN python -c "import ctranslate2, faster_whisper, torch, speechbrain, sklearn, fastapi; print('imports ok')"
+RUN python -c "import ctranslate2, faster_whisper, torch, torchaudio, onnxruntime, sklearn, fastapi; print('imports ok')"
 
 # --------------------------------------------------------------- runtime ----
 FROM python:${PYTHON_VERSION}-slim AS runtime
@@ -60,7 +60,7 @@ ENV VIRTUAL_ENV=/opt/venv \
     PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     WHISPER_MODEL_DIR=/models/whisper \
-    ECAPA_MODEL_DIR=/models/ecapa \
+    EMBEDDER_MODEL_DIR=/models/embedder \
     WHISPER_MODEL=${WHISPER_MODEL} \
     DEVICE=cpu \
     COMPUTE_TYPE=int8 \
@@ -70,8 +70,7 @@ ENV VIRTUAL_ENV=/opt/venv \
     # Trava qualquer acesso de rede das libs de modelo: tudo já está na imagem.
     HF_HUB_OFFLINE=1 \
     TRANSFORMERS_OFFLINE=1 \
-    HF_HOME=/tmp/hf \
-    SB_SAVEDIR=/tmp/speechbrain
+    HF_HOME=/tmp/hf
 
 # Usuário criado antes dos COPY: os modelos ficam somente-leitura para ele, o que
 # evita uma camada de `chown -R` que duplicaria centenas de MB na imagem.

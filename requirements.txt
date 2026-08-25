@@ -7,7 +7,7 @@ faster-whisper==1.1.1
 # A .so publicada vem marcada com executable stack, que kernels recentes (WSL2
 # incluso) recusam carregar; docker/fix_execstack.py limpa isso durante o build.
 ctranslate2==4.4.0
-speechbrain==1.0.2
+onnxruntime==1.20.1
 scikit-learn==1.5.2
 numpy==1.26.4
 huggingface_hub==0.26.5

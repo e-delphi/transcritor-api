@@ -10,8 +10,8 @@ gravados dentro da imagem no build e o container roda **totalmente offline**.
 |---|---|
 | Decodificação de áudio/vídeo | FFmpeg — qualquer formato vira PCM mono 16 kHz |
 | Transcrição | `faster-whisper` (CTranslate2) com `large-v3` embutido na imagem |
-| Impressão digital de voz | ECAPA-TDNN via SpeechBrain (`spkrec-ecapa-voxceleb`) |
-| Agrupamento de falantes | clustering aglomerativo (scikit-learn) |
+| Impressão digital de voz | WeSpeaker ResNet293-LM em ONNX (`wespeaker-voxceleb-resnet293-LM`) |
+| Agrupamento de falantes | spectral clustering com refinamento de afinidade e eigengap |
 | API | FastAPI + Uvicorn |
 
 Nenhum dos modelos é *gated*: não há token HuggingFace envolvido, nem no build nem
@@ -147,6 +147,63 @@ curl -X POST http://localhost:8000/transcribe -F "file=@reuniao.mp3" -F "num_spe
 
 Turnos são construídos a partir dos timestamps de palavra, então uma troca de falante no meio de uma frase é dividida corretamente.
 
+## Áudios longos: jobs com progresso
+
+Com `large-v3` a transcrição roda a ~1,5x o tempo real, então uma gravação de 1 h
+leva ~40 min — tempo demais para uma requisição HTTP síncrona. Para esses casos use
+`POST /jobs`, que aceita exatamente os mesmos campos de `/transcribe` mas devolve na
+hora um identificador:
+
+```bash
+curl -X POST http://localhost:8000/jobs -F "file=@reuniao.mp3" -F "num_speakers=3"
+```
+
+```json
+{ "job_id": "ab2f975e80dd448b", "status": "queued", "progress": 0.0, "status_url": "/jobs/ab2f975e80dd448b" }
+```
+
+Consulte o andamento quando quiser:
+
+```bash
+curl http://localhost:8000/jobs/ab2f975e80dd448b
+```
+
+```json
+{
+  "job_id": "ab2f975e80dd448b",
+  "status": "running",
+  "stage": "transcribing",
+  "stage_label": "transcrevendo",
+  "progress": 0.479,
+  "progress_percent": 47.9,
+  "elapsed_seconds": 16.8,
+  "eta_seconds": 18.3
+}
+```
+
+Quando `status` vira `done`, a resposta passa a incluir o campo `result` com o mesmo
+JSON que `/transcribe` devolveria. Se falhar, `status` vira `error` e vem um campo
+`error` com a mensagem.
+
+| Rota | O que faz |
+|---|---|
+| `POST /jobs` | Enfileira e devolve `job_id` (HTTP 202) |
+| `GET /jobs/{id}` | Status, progresso, ETA e o `result` quando pronto |
+| `GET /jobs` | Lista os jobs, sem as transcrições |
+| `DELETE /jobs/{id}` | Remove um job |
+
+Estágios do campo `stage`: `queued` → `decoding` → `transcribing` → `diarizing` → `done`.
+
+O progresso da transcrição é real, medido pelo trecho de áudio já coberto — não é uma
+barra estimada. Ele avança aos saltos porque o Whisper processa em janelas de 30 s:
+em áudios curtos são poucos degraus, em gravações longas a atualização é frequente.
+O `eta_seconds` só aparece a partir de 10% de progresso, onde a extrapolação passa a
+fazer sentido.
+
+Os jobs vivem em memória: reiniciar o container os descarta, e os concluídos expiram
+após `JOB_TTL_SECONDS` (1 h por padrão). Só uma transcrição roda por vez — as demais
+aguardam na fila, já que os modelos são serializados de qualquer forma.
+
 ## Outras rotas
 
 - `GET /health` — status
@@ -160,8 +217,17 @@ Turnos são construídos a partir dos timestamps de palavra, então uma troca de
 | `CPU_THREADS` | `8` | Threads do CTranslate2 |
 | `OMP_NUM_THREADS` | `8` | Threads do OpenMP/torch |
 | `MAX_UPLOAD_MB` | `512` | Limite de upload |
+| `JOB_TTL_SECONDS` | `3600` | Tempo até um job concluído expirar |
+| `MAX_JOBS` | `200` | Máximo de jobs mantidos em memória |
 | `DEVICE` | `cpu` | A imagem é CPU-only |
-| `DIARIZATION_THRESHOLD` | `0.65` | Distância cosseno do corte de clusters. Menor = mais falantes; maior = menos |
+| `DIARIZATION_WINDOW` | `2.0` | Duração (s) da janela de análise de voz. Maior = embedding mais estável, menos resolução temporal |
+| `DIARIZATION_HOP` | `0.75` | Passo (s) entre janelas |
+| `DIARIZATION_PRUNE` | `0.60` | Fração das similaridades fracas descartadas por linha. **Maior = menos falantes** |
+| `DIARIZATION_SMOOTHING` | `1` | Suavização temporal (desligada). Só ajuda em fala contínua, atrapalha em diálogo alternado |
+| `DIARIZATION_EIGENGAP` | `1.45` | Salto mínimo entre autovalores para aceitar mais de um falante. **Maior = menos falantes** |
+| `DIARIZATION_RATIO_TOLERANCE` | `0.90` | Em empate técnico, aceita o menor número de falantes. Menor = mais conservador |
+| `DIARIZATION_MAX_UNIT` | `3.5` | Segmentos até esta duração (s) viram uma unidade de análise, em vez de fatiados |
+| `DIARIZATION_MIN_RATIO` | `0.03` | Participação mínima na fala total para um falante ser mantido |
 
 Exemplo:
 
@@ -186,13 +252,15 @@ velocidade, troque o modelo, não o `beam_size`.
 ## Notas
 
 - Requisições são serializadas dentro do container (os modelos não são thread-safe). Para paralelismo, suba várias réplicas atrás de um balanceador.
-- A diarização automática decide o número de falantes cortando o dendrograma pela
-  distância `DIARIZATION_THRESHOLD`. Esse valor foi calibrado com áudio sintético de
-  duas vozes, não com um benchmark de fala real — trate-o como ponto de partida e
-  ajuste se o resultado dividir ou fundir falantes no seu material. **Passe
-  `num_speakers` sempre que souber o número**: é o que dá o melhor resultado.
-- Trechos muito curtos (menos de ~3 janelas de fala) são absorvidos pelo falante mais
-  parecido, então interjeições isoladas podem ser atribuídas ao interlocutor.
+- A diarização automática estima o número de falantes pelo **eigengap** do laplaciano
+  da matriz de similaridade, e não por um limiar fixo de distância. Ainda assim,
+  **passar `num_speakers` quando você souber o número continua sendo o mais confiável.**
+- Se ainda houver falantes a mais, aumente `DIARIZATION_PRUNE` (ex.: `0.70`) ou
+  `DIARIZATION_EIGENGAP` (ex.: `1.30`). Se falantes distintos estiverem sendo fundidos,
+  diminua os dois. Ambos são variáveis de ambiente, então dá para calibrar sem rebuild.
+- Trechos com participação abaixo de `DIARIZATION_MIN_RATIO` da fala total são
+  absorvidos pelo falante mais parecido, então interjeições muito curtas podem ser
+  atribuídas ao interlocutor.
 - A imagem é CPU-only de propósito (portabilidade e tamanho). Para GPU seria preciso uma base CUDA e `DEVICE=cuda`.
 
 ## Licença
@@ -208,6 +276,6 @@ As dependências têm licenças próprias, todas permissivas e compatíveis com 
 | Componente | Licença |
 |---|---|
 | faster-whisper, CTranslate2, modelos Whisper, FastAPI | MIT |
-| SpeechBrain, `spkrec-ecapa-voxceleb` | Apache-2.0 |
+| WeSpeaker `resnet293-LM` | CC-BY-4.0 |
 | PyTorch, scikit-learn | BSD-3-Clause |
 | FFmpeg | LGPL/GPL — invocado como processo externo, não vinculado ao código |

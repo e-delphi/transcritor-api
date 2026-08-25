@@ -6,21 +6,26 @@
 import logging
 import os
 import threading
-from typing import List, Optional
+from typing import Callable, List, Optional
 
 import numpy as np
 from faster_whisper import WhisperModel
 
 from .audio_io import SAMPLE_RATE, decode_to_mono16k
-from .diarization import SpeakerEmbedder, diarize, speaker_at
+from .diarization import diarize, speaker_at
+from .embedding import load_embedder
 
 logger = logging.getLogger(__name__)
 
 WHISPER_DIR = os.getenv("WHISPER_MODEL_DIR", "/models/whisper")
-ECAPA_DIR = os.getenv("ECAPA_MODEL_DIR", "/models/ecapa")
 DEVICE = os.getenv("DEVICE", "cpu")
 COMPUTE_TYPE = os.getenv("COMPUTE_TYPE", "int8")
 CPU_THREADS = int(os.getenv("CPU_THREADS", "0"))
+
+# Pesos de cada fase no progresso total. A transcrição domina o tempo; decodificar
+# é quase instantâneo e a diarização fica com o restante.
+DECODE_SHARE = 0.03
+TRANSCRIBE_SHARE = 0.82
 
 
 class Transcriber:
@@ -33,10 +38,10 @@ class Transcriber:
             cpu_threads=CPU_THREADS,
             local_files_only=True,
         )
-        logger.info("Carregando embedder ECAPA de %s", ECAPA_DIR)
-        self.embedder = SpeakerEmbedder(ECAPA_DIR, device=DEVICE)
-        # CTranslate2 e SpeechBrain não são thread-safe para chamadas concorrentes
-        # no mesmo objeto de modelo; serializa as requisições.
+        logger.info("Carregando embedder de falantes")
+        self.embedder = load_embedder()
+        # CTranslate2 não é thread-safe para chamadas concorrentes no mesmo objeto
+        # de modelo; serializa as requisições.
         self._lock = threading.Lock()
         logger.info("Modelos prontos")
 
@@ -51,9 +56,16 @@ class Transcriber:
         max_speakers: int = 8,
         beam_size: int = 5,
         initial_prompt: Optional[str] = None,
+        on_progress: Optional[Callable[[str, float], None]] = None,
     ) -> dict:
+        def report(stage: str, fraction: float) -> None:
+            if on_progress:
+                on_progress(stage, max(0.0, min(1.0, fraction)))
+
+        report("decoding", 0.0)
         audio = decode_to_mono16k(path)
         duration = len(audio) / SAMPLE_RATE
+        report("decoding", DECODE_SHARE)
 
         with self._lock:
             segments_iter, info = self.whisper.transcribe(
@@ -65,8 +77,20 @@ class Transcriber:
                 word_timestamps=True,
                 initial_prompt=initial_prompt,
             )
-            segments = list(segments_iter)
+            # O stage muda antes do primeiro segmento sair: o Whisper processa em
+            # janelas de 30 s, então há uma espera até o primeiro resultado aparecer.
+            report("transcribing", DECODE_SHARE)
 
+            # O gerador só transcreve sob demanda, então consumi-lo aos poucos dá
+            # o progresso real: quanto do áudio já foi coberto por segmentos.
+            segments = []
+            for segment in segments_iter:
+                segments.append(segment)
+                if duration > 0:
+                    done = min(segment.end / duration, 1.0)
+                    report("transcribing", DECODE_SHARE + TRANSCRIBE_SHARE * done)
+
+            report("diarizing", DECODE_SHARE + TRANSCRIBE_SHARE)
             speaker_turns: List[dict] = []
             if diarization and segments:
                 regions = [(s.start, s.end) for s in segments]
@@ -79,6 +103,7 @@ class Transcriber:
                     max_speakers=max_speakers,
                 )
 
+        report("diarizing", 1.0)
         return self._assemble(segments, speaker_turns, info, duration, diarization)
 
     def _assemble(self, segments, speaker_turns, info, duration, diarization) -> dict:

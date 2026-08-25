@@ -4,7 +4,7 @@
 
 """Baixa os modelos para dentro da imagem no momento do build.
 
-Ambos os repositórios são públicos e não-gated: nenhum token HuggingFace é
+Todos os repositórios são públicos e não-gated: nenhum token HuggingFace é
 necessário, nem no build nem em runtime.
 """
 
@@ -14,9 +14,9 @@ import sys
 
 from huggingface_hub import snapshot_download
 
-WHISPER_MODEL = os.getenv("WHISPER_MODEL", "small")
+WHISPER_MODEL = os.getenv("WHISPER_MODEL", "large-v3")
 WHISPER_DIR = os.getenv("WHISPER_MODEL_DIR", "/models/whisper")
-ECAPA_DIR = os.getenv("ECAPA_MODEL_DIR", "/models/ecapa")
+EMBEDDER_DIR = os.getenv("EMBEDDER_MODEL_DIR", "/models/embedder")
 
 WHISPER_REPOS = {
     "tiny": "Systran/faster-whisper-tiny",
@@ -26,6 +26,9 @@ WHISPER_REPOS = {
     "large-v2": "Systran/faster-whisper-large-v2",
     "large-v3": "Systran/faster-whisper-large-v3",
 }
+
+EMBEDDER_REPO = "Wespeaker/wespeaker-voxceleb-resnet293-LM"
+EMBEDDER_FILE = "voxceleb_resnet293_LM.onnx"
 
 
 def fetch(repo: str, target: str, allow_patterns=None) -> None:
@@ -47,28 +50,25 @@ def main() -> int:
         return 1
 
     fetch(WHISPER_REPOS[WHISPER_MODEL], WHISPER_DIR)
-    fetch(
-        "speechbrain/spkrec-ecapa-voxceleb",
-        ECAPA_DIR,
-        allow_patterns=["*.yaml", "*.ckpt", "*.txt", "*.json"],
-    )
 
-    # O hyperparams.yaml aponta para o repo remoto; reescreve para o diretório local
-    # de modo que o SpeechBrain nunca tente acessar a rede.
-    hparams = os.path.join(ECAPA_DIR, "hyperparams.yaml")
-    if os.path.exists(hparams):
-        with open(hparams, encoding="utf-8") as handle:
-            content = handle.read()
-        content = content.replace("speechbrain/spkrec-ecapa-voxceleb", ECAPA_DIR)
-        with open(hparams, "w", encoding="utf-8") as handle:
-            handle.write(content)
+    # WeSpeaker ResNet293-LM em ONNX: roda no onnxruntime que a imagem já usa,
+    # sem depender do SpeechBrain nem do PyTorch para a inferência.
+    fetch(EMBEDDER_REPO, EMBEDDER_DIR, allow_patterns=[EMBEDDER_FILE])
+    src = os.path.join(EMBEDDER_DIR, EMBEDDER_FILE)
+    dst = os.path.join(EMBEDDER_DIR, "model.onnx")
+    if os.path.exists(src):
+        os.replace(src, dst)
 
-    for path in (WHISPER_DIR, ECAPA_DIR):
+    for path in (WHISPER_DIR, EMBEDDER_DIR):
         files = sorted(os.listdir(path))
         print(f"==> {path}: {files}", flush=True)
         if not files:
             print(f"ERRO: {path} vazio")
             return 1
+
+    if not os.path.exists(dst):
+        print(f"ERRO: modelo do embedder ausente em {dst}")
+        return 1
     return 0
 
 

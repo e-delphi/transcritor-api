@@ -3,18 +3,20 @@
 
 """API HTTP de transcrição com separação por falante. Sem autenticação."""
 
+import json
 import logging
 import os
+import shutil
 import tempfile
 from contextlib import asynccontextmanager
 from typing import Optional, Tuple
 
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
-from fastapi.responses import JSONResponse, PlainTextResponse
+from fastapi import FastAPI, File, Form, HTTPException, Query, UploadFile
+from fastapi.responses import JSONResponse, PlainTextResponse, Response
 
-from .audio_io import AudioDecodeError
-from .jobs import manager
-from .pipeline import get_transcriber
+from .engine import get_engine
+from .formats import MEDIA_TYPES, RENDERERS
+from .jobs import Job, compute_job_id, manager
 
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO"),
@@ -22,20 +24,36 @@ logging.basicConfig(
 )
 logger = logging.getLogger("transcritor-api")
 
-MAX_UPLOAD_MB = int(os.getenv("MAX_UPLOAD_MB", "512"))
+MAX_UPLOAD_MB = int(os.getenv("MAX_UPLOAD_MB", "1024"))
+
+
+def _worker(job: Job) -> dict:
+    """Executa um job da fila. Roda na thread do gerenciador."""
+    audio = job.audio_path()
+    if audio is None:
+        raise RuntimeError("áudio do job não está mais disponível")
+
+    return get_engine().run(
+        audio,
+        on_progress=lambda stage, fraction: manager.update_progress(job, stage, fraction),
+        **job.options,
+    )
 
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     # Carrega os modelos na subida para que a primeira requisição não pague o custo.
-    get_transcriber()
+    get_engine()
+    manager.set_worker(_worker)
+    manager.restore()
+    manager.start_cleanup_loop()
     yield
 
 
 app = FastAPI(
     title="Transcritor API",
-    description="Transcrição com Whisper + diarização de falantes, offline e sem token.",
-    version="1.1.0",
+    description="Transcrição com WhisperX (Whisper + alinhamento + pyannote), offline e sem token.",
+    version="2.0.0",
     lifespan=lifespan,
 )
 
@@ -50,34 +68,38 @@ def _optional_int(value: Optional[str], field: str) -> Optional[int]:
         raise HTTPException(400, f"{field} deve ser um número inteiro") from None
 
 
-def _validate(
+def _options(
+    language: Optional[str],
     task: str,
+    diarization: bool,
+    alignment: bool,
     num_speakers: Optional[str],
     min_speakers: Optional[str],
     max_speakers: Optional[str],
-    beam_size: Optional[str],
 ) -> dict:
-    """Valida os parâmetros comuns às rotas síncrona e assíncrona."""
+    """Parâmetros que influenciam o resultado — e, portanto, o id do job."""
     if task not in ("transcribe", "translate"):
         raise HTTPException(400, "task deve ser 'transcribe' ou 'translate'")
 
-    n_speakers = _optional_int(num_speakers, "num_speakers")
-    lo = _optional_int(min_speakers, "min_speakers") or 1
-    hi = _optional_int(max_speakers, "max_speakers") or 8
-    beam = _optional_int(beam_size, "beam_size") or 5
+    exact = _optional_int(num_speakers, "num_speakers")
+    lo = _optional_int(min_speakers, "min_speakers")
+    hi = _optional_int(max_speakers, "max_speakers")
 
-    if n_speakers is not None and n_speakers < 1:
+    if exact is not None and exact < 1:
         raise HTTPException(400, "num_speakers deve ser >= 1")
-    if lo < 1 or hi < lo:
+    if lo is not None and lo < 1:
+        raise HTTPException(400, "min_speakers deve ser >= 1")
+    if lo is not None and hi is not None and hi < lo:
         raise HTTPException(400, "intervalo de falantes inválido")
-    if beam < 1:
-        raise HTTPException(400, "beam_size deve ser >= 1")
 
     return {
-        "num_speakers": n_speakers,
+        "language": (language or "").strip() or None,
+        "task": task,
+        "diarization": diarization,
+        "alignment": alignment,
+        "num_speakers": exact,
         "min_speakers": lo,
         "max_speakers": hi,
-        "beam_size": beam,
     }
 
 
@@ -115,31 +137,19 @@ async def transcribe(
     language: Optional[str] = Form(None, description="Código ISO (pt, en...). Vazio = detecta"),
     task: str = Form("transcribe", description="transcribe ou translate"),
     diarization: bool = Form(True, description="Separar por falante"),
+    alignment: bool = Form(True, description="Alinhar timestamps por palavra"),
     num_speakers: Optional[str] = Form(None, description="Número exato de falantes, se conhecido"),
     min_speakers: Optional[str] = Form(None),
     max_speakers: Optional[str] = Form(None),
-    beam_size: Optional[str] = Form(None),
-    initial_prompt: Optional[str] = Form(None),
 ):
     """Transcreve e devolve o JSON pronto. Para áudios longos, prefira POST /jobs."""
-    opts = _validate(task, num_speakers, min_speakers, max_speakers, beam_size)
+    opts = _options(language, task, diarization, alignment, num_speakers, min_speakers, max_speakers)
     tmp_path, written = await _save_upload(file)
-
     try:
         logger.info("Transcrevendo %s (%.1f MB)", file.filename, written / 1e6)
-        result = get_transcriber().run(
-            tmp_path,
-            language=language or None,
-            task=task,
-            diarization=diarization,
-            initial_prompt=initial_prompt or None,
-            **opts,
-        )
+        result = get_engine().run(tmp_path, **opts)
         result["filename"] = file.filename
         return JSONResponse(result)
-
-    except AudioDecodeError as exc:
-        raise HTTPException(400, f"não foi possível decodificar o áudio: {exc}") from exc
     except HTTPException:
         raise
     except Exception as exc:  # noqa: BLE001
@@ -156,47 +166,41 @@ async def create_job(
     language: Optional[str] = Form(None),
     task: str = Form("transcribe"),
     diarization: bool = Form(True),
+    alignment: bool = Form(True),
     num_speakers: Optional[str] = Form(None),
     min_speakers: Optional[str] = Form(None),
     max_speakers: Optional[str] = Form(None),
-    beam_size: Optional[str] = Form(None),
-    initial_prompt: Optional[str] = Form(None),
 ):
-    """Enfileira a transcrição e devolve um identificador para acompanhar o progresso."""
-    opts = _validate(task, num_speakers, min_speakers, max_speakers, beam_size)
+    """Enfileira a transcrição e devolve o id para acompanhar e baixar depois.
+
+    O id é derivado do conteúdo do arquivo: reenviar o mesmo áudio com as mesmas
+    opções devolve o resultado pronto imediatamente, sem reprocessar.
+    """
+    opts = _options(language, task, diarization, alignment, num_speakers, min_speakers, max_speakers)
     tmp_path, written = await _save_upload(file)
-    filename = file.filename
-
-    def work(job) -> dict:
-        try:
-            def on_progress(stage: str, fraction: float) -> None:
-                job.stage = stage
-                job.progress = fraction
-
-            result = get_transcriber().run(
-                tmp_path,
-                language=language or None,
-                task=task,
-                diarization=diarization,
-                initial_prompt=initial_prompt or None,
-                on_progress=on_progress,
-                **opts,
-            )
-            result["filename"] = filename
-            return result
-        finally:
-            if os.path.exists(tmp_path):
-                os.unlink(tmp_path)
 
     try:
-        job = manager.submit(filename, work)
-    except RuntimeError as exc:
-        if os.path.exists(tmp_path):
-            os.unlink(tmp_path)
-        raise HTTPException(429, str(exc)) from exc
+        job_id, file_sha = compute_job_id(tmp_path, opts)
+        existing = manager.find(job_id)
+        if existing is not None and existing.status != "error":
+            logger.info("Job %s reaproveitado (%s)", job_id, existing.status)
+            snapshot = existing.snapshot()
+            snapshot["cached"] = existing.status == "done"
+            snapshot["status_url"] = f"/jobs/{job_id}"
+            return JSONResponse(snapshot, status_code=200 if existing.status == "done" else 202)
 
-    logger.info("Job %s enfileirado (%s, %.1f MB)", job.id, filename, written / 1e6)
-    return {**job.snapshot(), "status_url": f"/jobs/{job.id}"}
+        job = Job(job_id, file.filename, file_sha, opts)
+        os.makedirs(job.dir, exist_ok=True)
+        suffix = os.path.splitext(file.filename or "")[1] or ".bin"
+        shutil.move(tmp_path, os.path.join(job.dir, f"audio{suffix}"))
+        tmp_path = None
+
+        manager.submit(job)
+        logger.info("Job %s enfileirado (%s, %.1f MB)", job.id, file.filename, written / 1e6)
+        return {**job.snapshot(), "cached": False, "status_url": f"/jobs/{job.id}"}
+    finally:
+        if tmp_path and os.path.exists(tmp_path):
+            os.unlink(tmp_path)
 
 
 @app.get("/jobs")
@@ -205,11 +209,42 @@ def list_jobs() -> dict:
 
 
 @app.get("/jobs/{job_id}")
-def get_job(job_id: str) -> dict:
-    job = manager.get(job_id)
+def get_job(job_id: str, incluir_resultado: bool = Query(False, description="Embutir o resultado")) -> dict:
+    job = manager.find(job_id)
     if job is None:
         raise HTTPException(404, "job não encontrado ou expirado")
-    return job.snapshot()
+    return job.snapshot(include_result=incluir_resultado)
+
+
+@app.get("/jobs/{job_id}/download")
+def download_job(
+    job_id: str,
+    formato: str = Query("json", description="json, txt, srt ou vtt"),
+):
+    """Baixa a transcrição pronta. Pode ser chamado quantas vezes quiser."""
+    job = manager.find(job_id)
+    if job is None:
+        raise HTTPException(404, "job não encontrado ou expirado")
+    if job.status == "error":
+        raise HTTPException(409, f"job terminou em erro: {job.error}")
+    if job.status != "done":
+        raise HTTPException(409, f"job ainda não concluído (status: {job.status})")
+
+    result = job.load_result()
+    if result is None:
+        raise HTTPException(410, "resultado não está mais disponível")
+
+    formato = formato.lower()
+    if formato not in MEDIA_TYPES:
+        raise HTTPException(400, f"formato inválido; use um de: {', '.join(MEDIA_TYPES)}")
+
+    base = os.path.splitext(job.filename or job.id)[0]
+    body = json.dumps(result, ensure_ascii=False, indent=2) if formato == "json" else RENDERERS[formato](result)
+    return Response(
+        content=body,
+        media_type=MEDIA_TYPES[formato],
+        headers={"Content-Disposition": f'attachment; filename="{base}.{formato}"'},
+    )
 
 
 @app.delete("/jobs/{job_id}")
@@ -223,11 +258,12 @@ def delete_job(job_id: str) -> dict:
 def index() -> str:
     return (
         "Transcritor API\n\n"
-        "POST /transcribe    multipart/form-data, campo 'file' -> JSON separado por falante\n"
-        "POST /jobs          igual ao acima, porem assincrono -> devolve job_id\n"
-        "GET  /jobs/{id}     status, progresso e resultado do job\n"
-        "GET  /jobs          lista os jobs\n"
-        "DELETE /jobs/{id}   remove um job\n"
-        "GET  /health        status do servico\n"
-        "GET  /docs          interface interativa\n"
+        "POST   /transcribe           multipart, campo 'file' -> JSON separado por falante\n"
+        "POST   /jobs                 igual, porem assincrono -> devolve job_id (sha256)\n"
+        "GET    /jobs/{id}            status, progresso e ETA\n"
+        "GET    /jobs/{id}/download   baixa o resultado (formato=json|txt|srt|vtt)\n"
+        "GET    /jobs                 lista os jobs\n"
+        "DELETE /jobs/{id}            remove um job e seus arquivos\n"
+        "GET    /health               status do servico\n"
+        "GET    /docs                 interface interativa\n"
     )

@@ -5,12 +5,32 @@ services:
       args:
         # tiny | base | small | medium | large-v2 | large-v3
         WHISPER_MODEL: ${WHISPER_MODEL:-large-v3}
+        # idiomas com alinhamento de palavras embutido
+        ALIGN_LANGUAGES: ${ALIGN_LANGUAGES:-pt,en}
+      # Token do HuggingFace usado apenas durante o build, para baixar o modelo
+      # de diarização. Não entra na imagem.
+      secrets:
+        - hf_token
     image: transcritor-api:latest
     container_name: transcritor-api
     ports:
       - "8000:8000"
     environment:
       COMPUTE_TYPE: int8
+      CPU_THREADS: 8
       OMP_NUM_THREADS: 8
-      MAX_UPLOAD_MB: 512
+      BATCH_SIZE: 8
+      MAX_UPLOAD_MB: 1024
+      # 6 horas: depois disso o áudio e a transcrição são apagados juntos.
+      JOB_TTL_SECONDS: 21600
+    volumes:
+      # Jobs e resultados sobrevivem ao reinício do container.
+      - transcritor-dados:/data
     restart: unless-stopped
+
+secrets:
+  hf_token:
+    file: ${HF_TOKEN_FILE:-./hf_token.txt}
+
+volumes:
+  transcritor-dados:

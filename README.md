@@ -1,267 +1,249 @@
 # Transcritor API
 
-Container autocontido de transcrição com **separação por falante**.
-Sem token, sem autenticação, sem download de modelo em runtime: os modelos são
-gravados dentro da imagem no build e o container roda **totalmente offline**.
+Container autocontido de transcrição com **separação por falante**, construído sobre
+[WhisperX](https://github.com/m-bain/whisperX). Os modelos são gravados dentro da
+imagem durante o build, então o container roda **offline, sem token e sem
+autenticação** — verificado com `--network none`, inclusive o alinhamento.
+
+A imagem ocupa **7,9 GB** em disco (`docker images` reporta um número bem maior porque
+o image store do containerd conta blobs comprimidos e descomprimidos).
 
 ## Como funciona
 
 | Etapa | Componente |
 |---|---|
 | Decodificação de áudio/vídeo | FFmpeg — qualquer formato vira PCM mono 16 kHz |
-| Transcrição | `faster-whisper` (CTranslate2) com `large-v3` embutido na imagem |
-| Impressão digital de voz | WeSpeaker ResNet293-LM em ONNX (`wespeaker-voxceleb-resnet293-LM`) |
-| Agrupamento de falantes | spectral clustering com refinamento de afinidade e eigengap |
-| API | FastAPI + Uvicorn |
+| Detecção de fala (VAD) | pyannote, com os pesos embarcados no próprio WhisperX |
+| Transcrição | `faster-whisper` (CTranslate2) com `large-v3` |
+| Alinhamento de palavras | wav2vec2 — timestamps precisos por palavra |
+| Separação de falantes | `pyannote/speaker-diarization-community-1` |
+| API e fila | FastAPI + Uvicorn |
 
-Nenhum dos modelos é *gated*: não há token HuggingFace envolvido, nem no build nem
-em runtime. Depois de construída, a imagem funciona com `--network none`.
+O VAD é o padrão do WhisperX, cujos pesos vêm dentro do pacote — nada é baixado e não
+há repositório restrito envolvido. O modo Silero seria pior aqui: ele busca o modelo no
+GitHub via `torch.hub` na primeira execução, exigindo rede e permissão de escrita.
 
-> **Por que não `openai-whisper` nem `pyannote.audio`:** o primeiro baixa o modelo no
-> uso inicial e o segundo exige um token HuggingFace (o repositório é *gated*). Os dois
-> inviabilizariam uma imagem autocontida que roda offline.
+## Token do HuggingFace: só no build
 
-## Estrutura
+O modelo de diarização exige aceite de termos no HuggingFace. Isso afeta **apenas o
+build** — o container em si nunca usa token nem acessa a rede.
 
-```
-app/
-  main.py         API HTTP e validação de entrada
-  pipeline.py     orquestra transcrição + diarização, monta o JSON
-  diarization.py  embeddings ECAPA e agrupamento de falantes
-  audio_io.py     decodificação via FFmpeg
-docker/
-  download_models.py  grava os modelos na imagem durante o build
-  fix_execstack.py    corrige .so com stack executável (ver Notas)
-Dockerfile
-docker-compose.yml
-requirements.txt
-```
+Antes do primeiro build, uma vez:
+
+1. Aceite os termos em
+   [pyannote/speaker-diarization-community-1](https://huggingface.co/pyannote/speaker-diarization-community-1).
+2. Crie um token de leitura em [huggingface.co/settings/tokens](https://huggingface.co/settings/tokens)
+   e grave-o num arquivo fora do repositório, por exemplo `~/hf_token.txt`.
+
+O token entra no build por `--secret`, que o monta apenas durante o passo de download.
+Ele **não fica gravado em nenhuma camada da imagem** e não aparece no histórico dela.
 
 ## Build
 
 ```bash
-docker build -t transcritor-api:latest .
+docker build --secret id=hf_token,src=$HOME/hf_token.txt -t transcritor-api:latest .
 ```
 
-O modelo padrão é **`large-v3`**, o mais preciso disponível. Para trocar
-(`tiny`, `base`, `small`, `medium`, `large-v2`, `large-v3`):
+Ou com compose (aponte `HF_TOKEN_FILE` para o seu arquivo):
 
 ```bash
-docker build --build-arg WHISPER_MODEL=small -t transcritor-api:small .
+HF_TOKEN_FILE=$HOME/hf_token.txt docker compose build
 ```
 
-| Modelo | Peso do modelo | Tamanho em disco | Velocidade (CPU, 16 núcleos) |
-|---|---|---|---|
-| `tiny` | 75 MB | ~2,2 GB | muito rápida |
-| `base` | 145 MB | ~2,3 GB | muito rápida |
-| `small` | 480 MB | **2,6 GB** (medido) | **~4x tempo real** (medido) |
-| `medium` | 1,5 GB | ~3,6 GB | ~2,5x tempo real |
-| `large-v3` (padrão) | 2,9 GB | **5,0 GB** (medido) | **~1,5x tempo real** (medido) |
+Para trocar o modelo Whisper (`tiny`, `base`, `small`, `medium`, `large-v2`, `large-v3`)
+ou os idiomas com alinhamento embutido:
 
-Medições feitas nesta máquina com um áudio de 35,6 s: `small` levou 9 s, `large-v3`
-levou 24 s. Ambos são mais rápidos que o tempo real. As linhas `tiny`/`base`/`medium`
-são estimadas a partir do peso do modelo.
+```bash
+docker build --secret id=hf_token,src=$HOME/hf_token.txt \
+  --build-arg WHISPER_MODEL=small --build-arg ALIGN_LANGUAGES=pt \
+  -t transcritor-api:small .
+```
 
-> **Sobre o tamanho:** `docker images` reporta 8,94 GB para a `large-v3`, mas o
-> sistema de arquivos real do container tem 5,0 GB — o image store do containerd
-> contabiliza blobs comprimidos e descomprimidos. O número que vale para disco e
-> transferência é o menor.
-
-O piso de ~2,1 GB vem das dependências (torch CPU, ffmpeg, ctranslate2, onnxruntime).
+Cada idioma de alinhamento pesa na imagem: o português usa um wav2vec2 de ~1,3 GB, o
+inglês um modelo do torchaudio bem menor. Idiomas sem alinhador embutido continuam
+sendo transcritos normalmente, apenas sem o refinamento de timestamp por palavra.
 
 ## Executar
 
 ```bash
-docker run -d --name transcritor-api -p 8000:8000 transcritor-api:latest
+docker run -d -p 8000:8000 -v transcritor-dados:/data transcritor-api:latest
 ```
 
-Ou com compose:
+O volume em `/data` guarda os jobs e as transcrições. Sem ele, tudo se perde quando o
+container é recriado.
 
 ```bash
-docker compose up -d --build
+docker compose up -d
 ```
 
-O primeiro `GET /health` responde `ok` assim que os modelos terminam de carregar (alguns segundos).
+Os modelos levam alguns minutos para carregar na subida; `GET /health` só responde
+quando estiverem prontos.
 
-## Rota principal
+## Rota síncrona
 
-`POST /transcribe` — `multipart/form-data`
+`POST /transcribe` — `multipart/form-data`. Devolve o JSON pronto. Boa para áudios
+curtos; para arquivos longos use a fila.
 
-| Campo | Tipo | Padrão | Descrição |
-|---|---|---|---|
-| `file` | arquivo | **obrigatório** | Áudio ou vídeo (mp3, wav, m4a, ogg, flac, mp4, mkv…) |
-| `language` | string | auto | Código ISO (`pt`, `en`…). Vazio = detecção automática |
-| `task` | string | `transcribe` | `transcribe` ou `translate` (traduz para inglês) |
-| `diarization` | bool | `true` | Separar por falante |
-| `num_speakers` | int | auto | Número exato de falantes, se conhecido — melhora bastante o resultado |
-| `min_speakers` | int | `1` | Piso da busca automática |
-| `max_speakers` | int | `8` | Teto da busca automática |
-| `beam_size` | int | `5` | Beam search do Whisper |
-| `initial_prompt` | string | — | Contexto/vocabulário para orientar a transcrição |
-
-### Exemplo
+| Campo | Padrão | Descrição |
+|---|---|---|
+| `file` | **obrigatório** | Áudio ou vídeo (mp3, wav, m4a, ogg, flac, mp4, mkv…) |
+| `language` | auto | Código ISO (`pt`, `en`…). Vazio = detecção automática |
+| `task` | `transcribe` | `transcribe` ou `translate` (traduz para inglês) |
+| `diarization` | `true` | Separar por falante |
+| `alignment` | `true` | Alinhar timestamps por palavra |
+| `num_speakers` | auto | Número exato de falantes, se conhecido |
+| `min_speakers` / `max_speakers` | auto | Limites da estimativa automática |
 
 ```bash
 curl -X POST http://localhost:8000/transcribe -F "file=@reuniao.mp3" -F "language=pt"
 ```
 
-Com número de falantes conhecido:
+## Fila: áudios longos, progresso e cache
 
-```bash
-curl -X POST http://localhost:8000/transcribe -F "file=@reuniao.mp3" -F "num_speakers=2"
-```
-
-### Resposta
-
-```json
-{
-  "language": "pt",
-  "language_probability": 0.99,
-  "duration": 42.31,
-  "diarization": true,
-  "num_speakers": 2,
-  "speakers": ["SPEAKER_00", "SPEAKER_01"],
-  "text": "transcrição completa ...",
-  "turns": [
-    { "speaker": "SPEAKER_00", "start": 0.0,  "end": 5.2,  "text": "Bom dia pessoal..." },
-    { "speaker": "SPEAKER_01", "start": 5.4,  "end": 11.8, "text": "Terminei a primeira versão..." }
-  ],
-  "by_speaker": {
-    "SPEAKER_00": { "total_time": 18.4, "turns": 5, "text": "tudo que o falante 0 disse" },
-    "SPEAKER_01": { "total_time": 21.9, "turns": 4, "text": "tudo que o falante 1 disse" }
-  },
-  "segments": [
-    {
-      "id": 0, "start": 0.0, "end": 5.2, "speaker": "SPEAKER_00",
-      "text": "Bom dia pessoal...",
-      "avg_logprob": -0.21, "no_speech_prob": 0.01,
-      "words": [{ "start": 0.0, "end": 0.32, "word": " Bom", "probability": 0.98, "speaker": "SPEAKER_00" }]
-    }
-  ]
-}
-```
-
-- **`turns`** é a separação por falante já pronta, em ordem cronológica — normalmente é o campo que você quer consumir.
-- **`by_speaker`** agrega todo o texto de cada pessoa.
-- **`segments`** traz o detalhe do Whisper com timestamps por palavra.
-
-Turnos são construídos a partir dos timestamps de palavra, então uma troca de falante no meio de uma frase é dividida corretamente.
-
-## Áudios longos: jobs com progresso
-
-Com `large-v3` a transcrição roda a ~1,5x o tempo real, então uma gravação de 1 h
-leva ~40 min — tempo demais para uma requisição HTTP síncrona. Para esses casos use
-`POST /jobs`, que aceita exatamente os mesmos campos de `/transcribe` mas devolve na
-hora um identificador:
+`POST /jobs` aceita os mesmos campos e devolve na hora um identificador.
 
 ```bash
 curl -X POST http://localhost:8000/jobs -F "file=@reuniao.mp3" -F "num_speakers=3"
 ```
 
 ```json
-{ "job_id": "ab2f975e80dd448b", "status": "queued", "progress": 0.0, "status_url": "/jobs/ab2f975e80dd448b" }
+{
+  "job_id": "3f9c…",
+  "file_sha256": "a71e…",
+  "status": "queued",
+  "progress_percent": 0.0,
+  "cached": false,
+  "status_url": "/jobs/3f9c…",
+  "expires_in_seconds": 21600
+}
 ```
 
-Consulte o andamento quando quiser:
+**O id é derivado do conteúdo do arquivo** (SHA-256) combinado com os parâmetros que
+influenciam o resultado. Reenviar o mesmo áudio com as mesmas opções responde
+imediatamente com `"cached": true` e HTTP 200, sem reprocessar. Mudar `num_speakers` ou
+o idioma gera um id diferente e reprocessa — se o id fosse apenas o hash do arquivo, o
+cache devolveria um resultado calculado sob outros parâmetros. O hash puro do arquivo
+fica disponível em `file_sha256`.
+
+### Acompanhar
 
 ```bash
-curl http://localhost:8000/jobs/ab2f975e80dd448b
+curl http://localhost:8000/jobs/3f9c…
 ```
 
 ```json
 {
-  "job_id": "ab2f975e80dd448b",
   "status": "running",
-  "stage": "transcribing",
-  "stage_label": "transcrevendo",
-  "progress": 0.479,
-  "progress_percent": 47.9,
-  "elapsed_seconds": 16.8,
-  "eta_seconds": 18.3
+  "stage": "aligning",
+  "stage_label": "alinhando palavras",
+  "progress_percent": 68.4,
+  "elapsed_seconds": 412.7,
+  "eta_seconds": 190.2,
+  "expires_in_seconds": 19830
 }
 ```
 
-Quando `status` vira `done`, a resposta passa a incluir o campo `result` com o mesmo
-JSON que `/transcribe` devolveria. Se falhar, `status` vira `error` e vem um campo
-`error` com a mensagem.
+Estágios: `queued` → `decoding` → `transcribing` → `aligning` → `diarizing` → `done`.
+O progresso é real, reportado pelas próprias etapas do WhisperX — inclusive a
+diarização, que informa segmentação e embeddings separadamente. O `eta_seconds` aparece
+a partir de 10% de progresso, onde a extrapolação passa a fazer sentido.
+
+### Baixar
+
+Quantas vezes quiser, enquanto o job não expirar:
+
+```bash
+curl -OJ "http://localhost:8000/jobs/3f9c…/download?formato=txt"
+```
+
+| `formato` | Conteúdo |
+|---|---|
+| `json` (padrão) | Resultado completo: segmentos, palavras, turnos, `by_speaker` |
+| `txt` | Diálogo rotulado por falante, ou texto corrido sem diarização |
+| `srt` / `vtt` | Legendas com o falante entre colchetes |
+
+### Rotas da fila
 
 | Rota | O que faz |
 |---|---|
-| `POST /jobs` | Enfileira e devolve `job_id` (HTTP 202) |
-| `GET /jobs/{id}` | Status, progresso, ETA e o `result` quando pronto |
-| `GET /jobs` | Lista os jobs, sem as transcrições |
-| `DELETE /jobs/{id}` | Remove um job |
+| `POST /jobs` | Enfileira e devolve o id (202, ou 200 se já estiver em cache) |
+| `GET /jobs/{id}` | Status, progresso e ETA (`?incluir_resultado=true` embute o JSON) |
+| `GET /jobs/{id}/download` | Baixa o resultado no formato escolhido |
+| `GET /jobs` | Lista os jobs |
+| `DELETE /jobs/{id}` | Remove o job e seus arquivos |
 
-Estágios do campo `stage`: `queued` → `decoding` → `transcribing` → `diarizing` → `done`.
+### Validade e persistência
 
-O progresso da transcrição é real, medido pelo trecho de áudio já coberto — não é uma
-barra estimada. Ele avança aos saltos porque o Whisper processa em janelas de 30 s:
-em áudios curtos são poucos degraus, em gravações longas a atualização é frequente.
-O `eta_seconds` só aparece a partir de 10% de progresso, onde a extrapolação passa a
-fazer sentido.
+Jobs e áudios vivem em `/data` e sobrevivem ao reinício do container. Passadas
+`JOB_TTL_SECONDS` (6 h por padrão), **o áudio e a transcrição são apagados juntos** por
+uma rotina que roda a cada 10 minutos.
 
-Os jobs vivem em memória: reiniciar o container os descarta, e os concluídos expiram
-após `JOB_TTL_SECONDS` (1 h por padrão). Só uma transcrição roda por vez — as demais
-aguardam na fila, já que os modelos são serializados de qualquer forma.
+Se o container for reiniciado no meio de uma transcrição, o job volta para a fila
+automaticamente em vez de ficar preso — o trabalho não se perde.
 
-## Outras rotas
+Só uma transcrição roda por vez; as demais aguardam na fila, já que os modelos são
+serializados de qualquer forma.
 
-- `GET /health` — status
-- `GET /docs` — Swagger UI interativo (dá para enviar o arquivo pelo navegador)
+## Formato do resultado
+
+```json
+{
+  "language": "pt",
+  "duration": 5306.2,
+  "alignment": true,
+  "diarization": true,
+  "num_speakers": 3,
+  "speakers": ["SPEAKER_00", "SPEAKER_01", "SPEAKER_02"],
+  "text": "transcrição completa ...",
+  "turns": [
+    { "speaker": "SPEAKER_00", "start": 0.0, "end": 5.2, "text": "Bom dia pessoal..." }
+  ],
+  "by_speaker": {
+    "SPEAKER_00": { "total_time": 18.4, "turns": 5, "text": "tudo que essa pessoa disse" }
+  },
+  "segments": [
+    {
+      "id": 0, "start": 0.0, "end": 5.2, "speaker": "SPEAKER_00",
+      "text": "Bom dia pessoal...",
+      "words": [{ "start": 0.0, "end": 0.32, "word": "Bom", "score": 0.98, "speaker": "SPEAKER_00" }]
+    }
+  ]
+}
+```
+
+`turns` é a separação por falante já pronta e costuma ser o campo mais útil.
+`by_speaker` agrega tudo que cada pessoa falou. Os turnos são cortados a partir dos
+timestamps de palavra, então uma troca de falante no meio da frase é dividida no ponto
+certo.
 
 ## Variáveis de ambiente
 
 | Variável | Padrão | Descrição |
 |---|---|---|
-| `COMPUTE_TYPE` | `int8` | `int8`, `int8_float32`, `float32`. `float32` é mais preciso e mais lento |
+| `COMPUTE_TYPE` | `int8` | `int8`, `int8_float32`, `float32`. Mais preciso e mais lento nessa ordem |
 | `CPU_THREADS` | `8` | Threads do CTranslate2 |
 | `OMP_NUM_THREADS` | `8` | Threads do OpenMP/torch |
-| `MAX_UPLOAD_MB` | `512` | Limite de upload |
-| `JOB_TTL_SECONDS` | `3600` | Tempo até um job concluído expirar |
-| `MAX_JOBS` | `200` | Máximo de jobs mantidos em memória |
+| `BATCH_SIZE` | `8` | Trechos transcritos por lote. Maior usa mais RAM |
+| `MAX_UPLOAD_MB` | `1024` | Limite de upload |
+| `JOB_TTL_SECONDS` | `21600` | Validade do job (6 h) antes da limpeza |
+| `JOBS_DIR` | `/data/jobs` | Onde ficam áudios e resultados |
+| `ALIGN_LANGUAGES` | `pt,en` | Idiomas com alinhamento (precisa estar embutido no build) |
 | `DEVICE` | `cpu` | A imagem é CPU-only |
-| `DIARIZATION_WINDOW` | `2.0` | Duração (s) da janela de análise de voz. Maior = embedding mais estável, menos resolução temporal |
-| `DIARIZATION_HOP` | `0.75` | Passo (s) entre janelas |
-| `DIARIZATION_PRUNE` | `0.60` | Fração das similaridades fracas descartadas por linha. **Maior = menos falantes** |
-| `DIARIZATION_SMOOTHING` | `1` | Suavização temporal (desligada). Só ajuda em fala contínua, atrapalha em diálogo alternado |
-| `DIARIZATION_EIGENGAP` | `1.45` | Salto mínimo entre autovalores para aceitar mais de um falante. **Maior = menos falantes** |
-| `DIARIZATION_RATIO_TOLERANCE` | `0.90` | Em empate técnico, aceita o menor número de falantes. Menor = mais conservador |
-| `DIARIZATION_MAX_UNIT` | `3.5` | Segmentos até esta duração (s) viram uma unidade de análise, em vez de fatiados |
-| `DIARIZATION_MIN_RATIO` | `0.03` | Participação mínima na fala total para um falante ser mantido |
-
-Exemplo:
-
-```bash
-docker run -d -p 8000:8000 -e COMPUTE_TYPE=float32 -e OMP_NUM_THREADS=8 transcritor-api:latest
-```
-
-## Desempenho
-
-Medido com `large-v3`, 16 núcleos, `COMPUTE_TYPE=int8`:
-
-| | |
-|---|---|
-| Carga dos modelos (startup) | 37 s — o `/health` só responde depois disso |
-| RAM em uso | ~2,0 GB |
-| Transcrição | ~1,5x mais rápido que o tempo real |
-
-Reduzir `beam_size` de 5 para 1 economiza apenas ~8% (23 s → 21 s), porque o gargalo
-está no encoder, não na busca — não vale a perda de precisão. Se precisar de mais
-velocidade, troque o modelo, não o `beam_size`.
 
 ## Notas
 
-- Requisições são serializadas dentro do container (os modelos não são thread-safe). Para paralelismo, suba várias réplicas atrás de um balanceador.
-- A diarização automática estima o número de falantes pelo **eigengap** do laplaciano
-  da matriz de similaridade, e não por um limiar fixo de distância. Ainda assim,
-  **passar `num_speakers` quando você souber o número continua sendo o mais confiável.**
-- Se ainda houver falantes a mais, aumente `DIARIZATION_PRUNE` (ex.: `0.70`) ou
-  `DIARIZATION_EIGENGAP` (ex.: `1.30`). Se falantes distintos estiverem sendo fundidos,
-  diminua os dois. Ambos são variáveis de ambiente, então dá para calibrar sem rebuild.
-- Trechos com participação abaixo de `DIARIZATION_MIN_RATIO` da fala total são
-  absorvidos pelo falante mais parecido, então interjeições muito curtas podem ser
-  atribuídas ao interlocutor.
-- A imagem é CPU-only de propósito (portabilidade e tamanho). Para GPU seria preciso uma base CUDA e `DEVICE=cuda`.
+- A imagem é CPU-only de propósito, por portabilidade e tamanho. Para GPU seria preciso
+  uma base CUDA e `DEVICE=cuda` — o WhisperX ganha bastante com processamento em lote
+  nesse cenário.
+- Passar `num_speakers` quando você souber o número continua sendo o caminho mais
+  confiável, em qualquer motor de diarização.
+- O `beam_size` não é ajustável por requisição: no WhisperX ele é definido ao carregar
+  o modelo.
+- O alinhamento depende do `punkt` do NLTK, que normalmente é baixado na primeira
+  execução. Ele vem embutido na imagem; sem isso o alinhamento falharia em silêncio
+  num container sem rede, caindo nos timestamps menos precisos do Whisper.
+- Em CPU o processamento fica em torno de 1x o tempo real com `large-v3` — mais lento
+  que a versão anterior, que não fazia alinhamento forçado nem usava o pyannote.
 
 ## Licença
 
@@ -271,11 +253,19 @@ não dispara nenhuma obrigação da GPL; ela só se aplica ao **distribuir** o s
 um produto que o embuta, caso em que o código-fonte deve ser fornecido sob os mesmos
 termos.
 
-As dependências têm licenças próprias, todas permissivas e compatíveis com a GPLv3:
+As dependências têm licenças próprias, todas compatíveis com a GPLv3:
 
 | Componente | Licença |
 |---|---|
+| WhisperX | BSD-2-Clause |
 | faster-whisper, CTranslate2, modelos Whisper, FastAPI | MIT |
-| WeSpeaker `resnet293-LM` | CC-BY-4.0 |
-| PyTorch, scikit-learn | BSD-3-Clause |
+| pyannote.audio | MIT |
+| `pyannote/speaker-diarization-community-1` | CC-BY-4.0 |
+| `jonatasgrosman/wav2vec2-large-xlsr-53-portuguese` | Apache-2.0 |
+| PyTorch, torchaudio | BSD-3-Clause |
 | FFmpeg | LGPL/GPL — invocado como processo externo, não vinculado ao código |
+
+Os modelos de diarização e alinhamento embutidos na imagem são redistribuídos sob
+CC-BY-4.0 e Apache-2.0, com atribuição a
+[pyannote](https://huggingface.co/pyannote/speaker-diarization-community-1) e a
+[jonatasgrosman](https://huggingface.co/jonatasgrosman/wav2vec2-large-xlsr-53-portuguese).

@@ -1,0 +1,8 @@
+# Instalação nativa (motor audio.cpp). Não usa PyTorch nem WhisperX: a inferência
+# roda no servidor audio.cpp, e o PyAV traz o FFmpeg embutido para decodificar
+# qualquer formato de áudio ou vídeo. Requer Python 3.11 ou mais novo.
+fastapi==0.115.6
+uvicorn[standard]==0.32.1
+python-multipart==0.0.20
+numpy==2.4.6
+av==18.1.0

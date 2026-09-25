@@ -37,6 +37,10 @@ from .numbers_pt import to_digits
 
 logger = logging.getLogger(__name__)
 
+# Identificação e recursos do motor; a API valida as opções com isto.
+NAME = "audiocpp"
+CAPABILITIES = {"diarization": False, "translate": False, "default_diarization": False}
+
 SERVER = os.getenv("AUDIOCPP_URL", "http://127.0.0.1:8081").rstrip("/")
 ASR_MODEL = os.getenv("AUDIOCPP_ASR_MODEL", "qwen3-asr")
 ALIGN_MODEL = os.getenv("AUDIOCPP_ALIGN_MODEL", "qwen3-align")

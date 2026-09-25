@@ -8,21 +8,6 @@ autenticação** — verificado com `--network none`, inclusive o alinhamento.
 A imagem ocupa **7,9 GB** em disco (`docker images` reporta um número bem maior porque
 o image store do containerd conta blobs comprimidos e descomprimidos).
 
-Há também uma **instalação nativa para Windows com GPU** (AMD, NVIDIA ou Intel, via
-Vulkan), que troca o motor por Qwen3-ASR e Qwen3-ForcedAligner rodando no
-[audio.cpp](https://github.com/0xShug0/audio.cpp). Ela não separa falantes, mas marca
-cada palavra com mais precisão e é cerca de 6× mais rápida — veja
-[Motor nativo com GPU](#motor-nativo-com-gpu-windows).
-
-| | Docker (WhisperX, CPU) | Nativo (Qwen3 + audio.cpp, GPU) |
-|---|---|---|
-| Separação por falante | sim | não |
-| Tradução para inglês | sim | não |
-| Erro mediano no início da palavra | ~65 ms (viés de +63 ms) | ~22 ms (viés de −4 ms) |
-| Palavras com erro até 100 ms | 83–86% | ~98% |
-| Reunião de 88 min | ~36 min | ~6 min |
-| Números por extenso | como o modelo escreveu | algarismos acima de dez (pt) |
-
 ## Como funciona
 
 | Etapa | Componente |
@@ -175,24 +160,7 @@ curl -OJ "http://localhost:8000/jobs/3f9c…/download?formato=txt"
 |---|---|
 | `json` (padrão) | Resultado completo: segmentos, palavras, turnos, `by_speaker` |
 | `txt` | Diálogo rotulado por falante, ou texto corrido sem diarização |
-| `srt` / `vtt` | Legendas em frases curtas, com o falante entre colchetes quando houver |
-
-As legendas são montadas a partir do instante de cada palavra. Por padrão cada bloco tem
-**até 2 linhas de 42 caracteres** e no máximo 7 segundos, e é quebrado de preferência
-no fim de frase, numa pausa da fala ou depois de vírgula — nunca deixando uma preposição
-ou artigo sozinho no fim da linha. Blocos muito curtos são unidos ao seguinte, cada um
-permanece meio segundo após a última palavra e nunca se sobrepõe ao próximo. Os limites
-podem ser ajustados por download:
-
-```bash
-curl -OJ "http://localhost:8000/jobs/3f9c…/download?formato=srt&max_caracteres=37&max_linhas=1"
-```
-
-| Parâmetro | Padrão | Faixa |
-|---|---|---|
-| `max_caracteres` | `42` | 10–120 |
-| `max_linhas` | `2` | 1–4 |
-| `max_segundos` | `7` | 1–20 |
+| `srt` / `vtt` | Legendas com o falante entre colchetes |
 
 ### Rotas da fila
 
@@ -261,71 +229,6 @@ certo.
 | `JOBS_DIR` | `/data/jobs` | Onde ficam áudios e resultados |
 | `ALIGN_LANGUAGES` | `pt,en` | Idiomas com alinhamento (precisa estar embutido no build) |
 | `DEVICE` | `cpu` | A imagem é CPU-only |
-| `LEGENDA_MAX_CARACTERES` | `42` | Caracteres por linha de legenda |
-| `LEGENDA_MAX_LINHAS` | `2` | Linhas por bloco de legenda |
-| `LEGENDA_MAX_SEGUNDOS` | `7` | Duração máxima de um bloco |
-| `LEGENDA_MIN_SEGUNDOS` | `1` | Blocos mais curtos são unidos ao seguinte, se couber |
-
-## Motor nativo com GPU (Windows)
-
-O Docker Desktop no Windows não repassa GPUs AMD para containers, então o motor com GPU
-é instalado direto no sistema. Ele usa o servidor do audio.cpp com backend Vulkan, que
-funciona com placas AMD, NVIDIA e Intel sem CUDA nem ROCm.
-
-| Etapa | Componente |
-|---|---|
-| Decodificação | PyAV (FFmpeg embutido no pacote) |
-| Divisão do áudio | Blocos de até 60 s, cortados no trecho de menor energia; silêncio é descartado |
-| Transcrição | Qwen3-ASR 1.7B (q8_0) |
-| Alinhamento de palavras | Qwen3-ForcedAligner 0.6B (q8_0) |
-| Números | Por extenso → algarismos, em português |
-
-Requisitos: Windows 10 ou 11, Python 3.11 ou mais novo e um driver de vídeo com Vulkan.
-A instalação baixa ~3,7 GB (servidor e dois modelos) e confere o SHA-256 de cada arquivo.
-
-Abra **`native\windows\instalar.bat`** com duplo clique, ou pelo terminal:
-
-```bat
-native\windows\instalar.bat
-```
-
-Tudo fica em `%LOCALAPPDATA%\TranscritorAPI` (use `-Destino` para mudar). Se os `.gguf`
-já estiverem baixados, `-ModelosDe C:\pasta\dos\modelos` os aproveita sem copiar. Rodar
-de novo é seguro: o que já está instalado só é conferido. Para iniciar, abra
-**`native\windows\iniciar.bat`**:
-
-```bat
-native\windows\iniciar.bat -Porta 8000
-```
-
-Ele sobe o audio.cpp na porta 8081, espera ele responder e inicia a API em
-`http://127.0.0.1:8000` (`-Porta` e `-Endereco` mudam isso). Ctrl+C encerra os
-dois. Os `.bat` apenas chamam `install.ps1` e `start.ps1` liberando a
-política de execução do PowerShell para esses scripts. As
-rotas e o formato do resultado são os mesmos da versão Docker, com duas diferenças:
-
-- `diarization` é `false` por padrão, e pedir `true` devolve HTTP 400 — o motor não
-  separa falantes. `task=translate` também é recusado.
-- O resultado traz `"engine": "audiocpp:qwen3"`, e `GET /health` informa o motor ativo.
-
-**Números.** Em português, números por extenso maiores que dez viram algarismos, como
-pede a convenção de legendagem: "dois mil e vinte e seis" → `2026`, "trinta e cinco por
-cento" → `35%`, "um milhão e duzentos mil" → `1.200.000`. Até dez continuam por
-extenso ("três pessoas"), e enumerações como "dois e três" não são somadas. O limite é
-ajustável com `NUMEROS_POR_EXTENSO_ATE`.
-
-| Variável | Padrão | Descrição |
-|---|---|---|
-| `ENGINE` | `whisperx` | `audiocpp` ativa este motor (o `start.ps1` já define) |
-| `AUDIOCPP_URL` | `http://127.0.0.1:8081` | Endereço do servidor audio.cpp |
-| `AUDIOCPP_ASR_MODEL` / `AUDIOCPP_ALIGN_MODEL` | `qwen3-asr` / `qwen3-align` | Ids dos modelos no servidor |
-| `AUDIOCPP_TIMEOUT` | `900` | Tempo máximo de uma chamada ao servidor, em segundos |
-| `BLOCO_MAX_SEGUNDOS` | `60` | Tamanho máximo de cada bloco enviado ao ASR |
-| `NUMEROS_POR_EXTENSO_ATE` | `10` | Números até este valor ficam por extenso |
-
-O alinhador cobre português, inglês, espanhol, francês, alemão, italiano, russo,
-japonês, coreano, chinês e cantonês. Em outros idiomas o texto sai normalmente, mas o
-tempo de cada palavra é estimado pela posição dentro do bloco.
 
 ## Notas
 
@@ -361,9 +264,6 @@ As dependências têm licenças próprias, todas compatíveis com a GPLv3:
 | `jonatasgrosman/wav2vec2-large-xlsr-53-portuguese` | Apache-2.0 |
 | PyTorch, torchaudio | BSD-3-Clause |
 | FFmpeg | LGPL/GPL — invocado como processo externo, não vinculado ao código |
-| audio.cpp (instalação nativa) | Apache-2.0 |
-| Qwen3-ASR, Qwen3-ForcedAligner (instalação nativa) | Apache-2.0 |
-| PyAV (instalação nativa) | BSD-3-Clause |
 
 Os modelos de diarização e alinhamento embutidos na imagem são redistribuídos sob
 CC-BY-4.0 e Apache-2.0, com atribuição a

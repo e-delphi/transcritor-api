@@ -5,7 +5,7 @@
 # Funciona com placas AMD, NVIDIA e Intel que tenham driver Vulkan. Nada disso
 # precisa de Docker: o Docker Desktop não repassa GPUs AMD para containers.
 #
-#   powershell -ExecutionPolicy Bypass -File native\windows\install.ps1
+#   instalar.bat   (ou: powershell -ExecutionPolicy Bypass -File install.ps1)
 #
 # Parâmetros:
 #   -Destino     pasta da instalação (padrão: %LOCALAPPDATA%\TranscritorAPI)
@@ -23,7 +23,8 @@ param(
 # erro fatal. Os programas são conferidos pelo código de saída; os cmdlets
 # críticos usam -ErrorAction Stop.
 $ErrorActionPreference = "Continue"
-$Repo = (Resolve-Path (Join-Path $PSScriptRoot "..\..")).Path
+# A API roda direto desta pasta (app\); a instalação guarda só o caminho dela.
+$Repo = $PSScriptRoot
 
 $AudioCppVersao = "v0.8.1"
 $AudioCppZip = "audio-$AudioCppVersao-bin-windows-x64-vulkan.zip"

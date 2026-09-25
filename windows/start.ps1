@@ -3,7 +3,7 @@
 #
 # Sobe o servidor audio.cpp (GPU) e a API. Ctrl+C encerra os dois.
 #
-#   powershell -ExecutionPolicy Bypass -File native\windows\start.ps1 [-Porta 8000]
+#   iniciar.bat [-Porta 8000]   (ou: powershell -ExecutionPolicy Bypass -File start.ps1)
 
 param(
     [string]$Destino = (Join-Path $env:LOCALAPPDATA "TranscritorAPI"),
@@ -17,7 +17,7 @@ param(
 # críticos usam -ErrorAction Stop.
 $ErrorActionPreference = "Continue"
 if (-not (Test-Path "$Destino\server.json")) {
-    throw "instalação não encontrada em $Destino; rode primeiro native\windows\install.ps1"
+    throw "instalação não encontrada em $Destino; rode primeiro instalar.bat"
 }
 $Repo = (Get-Content -Raw "$Destino\repo.txt").Trim()
 
@@ -47,7 +47,6 @@ try {
         throw "o servidor audio.cpp não subiu; veja os logs em $Destino\logs"
     }
 
-    $env:ENGINE = "audiocpp"
     $env:AUDIOCPP_URL = "http://127.0.0.1:8081"
     $env:JOBS_DIR = "$Destino\data\jobs"
     if (-not $env:JOB_TTL_SECONDS) { $env:JOB_TTL_SECONDS = "21600" }

@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 # Copyright (C) 2026 Eduardo
 
-"""API HTTP de transcrição com separação por falante. Sem autenticação."""
+"""API HTTP de transcrição e legendas. Sem autenticação."""
 
 import json
 import logging
@@ -14,7 +14,8 @@ from typing import Optional, Tuple
 from fastapi import FastAPI, File, Form, HTTPException, Query, UploadFile
 from fastapi.responses import JSONResponse, PlainTextResponse, Response
 
-from .engine import get_engine
+from .engine import CAPABILITIES, get_engine
+from .engine import NAME as ENGINE
 from .formats import MEDIA_TYPES, RENDERERS
 from .jobs import Job, compute_job_id, manager
 
@@ -52,8 +53,8 @@ async def lifespan(_: FastAPI):
 
 app = FastAPI(
     title="Transcritor API",
-    description="Transcrição com WhisperX (Whisper + alinhamento + pyannote), offline e sem token.",
-    version="2.0.0",
+    description=f"Transcrição e legendas offline, sem token. Motor: {ENGINE}.",
+    version="2.1.0",
     lifespan=lifespan,
 )
 
@@ -71,7 +72,7 @@ def _optional_int(value: Optional[str], field: str) -> Optional[int]:
 def _options(
     language: Optional[str],
     task: str,
-    diarization: bool,
+    diarization: Optional[bool],
     alignment: bool,
     num_speakers: Optional[str],
     min_speakers: Optional[str],
@@ -80,6 +81,14 @@ def _options(
     """Parâmetros que influenciam o resultado — e, portanto, o id do job."""
     if task not in ("transcribe", "translate"):
         raise HTTPException(400, "task deve ser 'transcribe' ou 'translate'")
+
+    caps = CAPABILITIES
+    if task == "translate" and not caps["translate"]:
+        raise HTTPException(400, f"o motor {ENGINE} não traduz; use task=transcribe")
+    if diarization is None:
+        diarization = caps["default_diarization"]
+    if diarization and not caps["diarization"]:
+        raise HTTPException(400, f"o motor {ENGINE} não separa falantes; envie diarization=false")
 
     exact = _optional_int(num_speakers, "num_speakers")
     lo = _optional_int(min_speakers, "min_speakers")
@@ -128,7 +137,7 @@ async def _save_upload(file: UploadFile) -> Tuple[str, int]:
 
 @app.get("/health")
 def health() -> dict:
-    return {"status": "ok", "models_loaded": True}
+    return {"status": "ok", "models_loaded": True, "engine": ENGINE}
 
 
 @app.post("/transcribe")
@@ -136,7 +145,7 @@ async def transcribe(
     file: UploadFile = File(..., description="Arquivo de áudio ou vídeo"),
     language: Optional[str] = Form(None, description="Código ISO (pt, en...). Vazio = detecta"),
     task: str = Form("transcribe", description="transcribe ou translate"),
-    diarization: bool = Form(True, description="Separar por falante"),
+    diarization: Optional[bool] = Form(None, description="Separar por falante (padrão do motor)"),
     alignment: bool = Form(True, description="Alinhar timestamps por palavra"),
     num_speakers: Optional[str] = Form(None, description="Número exato de falantes, se conhecido"),
     min_speakers: Optional[str] = Form(None),
@@ -165,7 +174,7 @@ async def create_job(
     file: UploadFile = File(..., description="Arquivo de áudio ou vídeo"),
     language: Optional[str] = Form(None),
     task: str = Form("transcribe"),
-    diarization: bool = Form(True),
+    diarization: Optional[bool] = Form(None),
     alignment: bool = Form(True),
     num_speakers: Optional[str] = Form(None),
     min_speakers: Optional[str] = Form(None),
@@ -180,7 +189,7 @@ async def create_job(
     tmp_path, written = await _save_upload(file)
 
     try:
-        job_id, file_sha = compute_job_id(tmp_path, opts)
+        job_id, file_sha = compute_job_id(tmp_path, {**opts, "engine": ENGINE})
         existing = manager.find(job_id)
         if existing is not None and existing.status != "error":
             logger.info("Job %s reaproveitado (%s)", job_id, existing.status)
@@ -220,8 +229,15 @@ def get_job(job_id: str, incluir_resultado: bool = Query(False, description="Emb
 def download_job(
     job_id: str,
     formato: str = Query("json", description="json, txt, srt ou vtt"),
+    max_caracteres: Optional[int] = Query(None, ge=10, le=120, description="Caracteres por linha de legenda"),
+    max_linhas: Optional[int] = Query(None, ge=1, le=4, description="Linhas por bloco de legenda"),
+    max_segundos: Optional[float] = Query(None, ge=1, le=20, description="Duração máxima de um bloco"),
 ):
-    """Baixa a transcrição pronta. Pode ser chamado quantas vezes quiser."""
+    """Baixa a transcrição pronta. Pode ser chamado quantas vezes quiser.
+
+    As legendas (srt, vtt) são montadas na hora a partir do instante de cada
+    palavra, então dá para baixar o mesmo job em tamanhos de legenda diferentes.
+    """
     job = manager.find(job_id)
     if job is None:
         raise HTTPException(404, "job não encontrado ou expirado")
@@ -239,7 +255,14 @@ def download_job(
         raise HTTPException(400, f"formato inválido; use um de: {', '.join(MEDIA_TYPES)}")
 
     base = os.path.splitext(job.filename or job.id)[0]
-    body = json.dumps(result, ensure_ascii=False, indent=2) if formato == "json" else RENDERERS[formato](result)
+    if formato == "json":
+        body = json.dumps(result, ensure_ascii=False, indent=2)
+    elif formato in ("srt", "vtt"):
+        limits = {k: v for k, v in (("max_line", max_caracteres), ("max_lines", max_linhas),
+                                    ("max_duration", max_segundos)) if v is not None}
+        body = RENDERERS[formato](result, **limits)
+    else:
+        body = RENDERERS[formato](result)
     return Response(
         content=body,
         media_type=MEDIA_TYPES[formato],
@@ -257,11 +280,12 @@ def delete_job(job_id: str) -> dict:
 @app.get("/", response_class=PlainTextResponse)
 def index() -> str:
     return (
-        "Transcritor API\n\n"
-        "POST   /transcribe           multipart, campo 'file' -> JSON separado por falante\n"
+        f"Transcritor API (motor: {ENGINE})\n\n"
+        "POST   /transcribe           multipart, campo 'file' -> JSON com o instante de cada palavra\n"
         "POST   /jobs                 igual, porem assincrono -> devolve job_id (sha256)\n"
         "GET    /jobs/{id}            status, progresso e ETA\n"
         "GET    /jobs/{id}/download   baixa o resultado (formato=json|txt|srt|vtt)\n"
+        "                             legendas: max_caracteres=42 max_linhas=2 max_segundos=7\n"
         "GET    /jobs                 lista os jobs\n"
         "DELETE /jobs/{id}            remove um job e seus arquivos\n"
         "GET    /health               status do servico\n"

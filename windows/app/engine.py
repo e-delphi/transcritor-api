@@ -53,6 +53,21 @@ SEARCH_S = 15.0          # onde procurar o ponto de corte, antes do limite
 FRAME_S = 0.03
 SILENCE_PCT = 20         # percentil de energia tratado como silêncio
 MIN_VOICED = 0.05        # abaixo disso o bloco é considerado silêncio
+# Regiões de fala. Só elas vão para o modelo: em ruído ou silêncio longo o Qwen3
+# inventa frases (medido: 90 s de ruído com estalos viraram "É um dos mais
+# importantes..."), e um bloco sem fala nenhuma faz o audio.cpp responder 500.
+MIN_RUN_S = 0.12         # trecho acima do limiar mais curto que isto é estalo
+MIN_SPEECH_S = 0.5       # região com menos fala que isto é descartada
+SPLIT_GAP_S = 5.0        # silêncio maior que isto separa blocos
+PAD_S = 0.3              # folga antes e depois da fala
+
+# Laço do modelo: em música ou ruído contínuo o Qwen3 às vezes repete a mesma
+# palavra ou frase até o limite (medido numa gravação de 2 h: blocos de 50 s com
+# 258 palavras e só 3 distintas). Uma frase de até LOOP_MAX_UNIT palavras
+# repetida LOOP_MIN_REPS vezes seguidas fica com LOOP_KEEP repetições.
+LOOP_MAX_UNIT = 8
+LOOP_MIN_REPS = 4
+LOOP_KEEP = 2
 
 # Idiomas que o Qwen3-ForcedAligner aceita, pelo nome que ele espera.
 ALIGN_LANGUAGES = {
@@ -60,6 +75,20 @@ ALIGN_LANGUAGES = {
     "it": "Italian", "ru": "Russian", "ko": "Korean", "ja": "Japanese", "zh": "Chinese",
     "yue": "Cantonese",
 }
+
+# O Qwen3-ASR repete o idioma pedido ("pt"), mas quando detecta sozinho devolve o
+# nome em inglês ("Portuguese"). Sem normalizar, a detecção automática perdia o
+# alinhador e a conversão de números, que procuram pelo código.
+LANGUAGE_CODES = {name.lower(): code for code, name in ALIGN_LANGUAGES.items()}
+
+
+def language_code(language: Optional[str]) -> Optional[str]:
+    lang = (language or "").strip().lower()
+    return LANGUAGE_CODES.get(lang, lang) or None
+
+
+class NoSpeech(Exception):
+    """O audio.cpp não achou texto no bloco (responde 500 em vez de texto vazio)."""
 
 TRANSCRIBE_SHARE = 0.5   # peso da transcrição no progresso; o alinhamento leva o resto
 
@@ -100,27 +129,72 @@ def decode(path: str) -> np.ndarray:
     return np.frombuffer(out.stdout, dtype=np.int16)
 
 
+def _split_long(rms: np.ndarray, start: int, end: int) -> List[tuple]:
+    """Parte [start, end) em blocos de até MAX_CHUNK_S, no vale de energia perto do limite."""
+    max_f, search_f = int(MAX_CHUNK_S / FRAME_S), int(SEARCH_S / FRAME_S)
+    out = []
+    while start < end:
+        if end - start <= max_f:
+            stop = end
+        else:
+            lo, hi = start + max_f - search_f, start + max_f
+            window = np.convolve(rms[lo:hi], np.ones(10) / 10, mode="same")
+            stop = lo + int(np.argmin(window))
+        out.append((start, stop))
+        start = stop
+    return out
+
+
 def energy_chunks(samples: np.ndarray) -> List[dict]:
-    """Blocos de até MAX_CHUNK_S, cortados no ponto mais silencioso perto do limite."""
+    """Blocos de até MAX_CHUNK_S cobrindo só as regiões com fala.
+
+    1. quadro "com voz" = energia acima do dobro do percentil 20 (o chão de ruído);
+    2. sequências mais curtas que MIN_RUN_S são estalos e não contam;
+    3. regiões separadas por menos de SPLIT_GAP_S ficam no mesmo bloco;
+    4. região com menos de MIN_SPEECH_S de fala é descartada;
+    5. região longa é partida no ponto mais silencioso perto de MAX_CHUNK_S.
+    """
     frame = int(FRAME_S * RATE)
     n = len(samples) // frame
     if n == 0:
         return []
     rms = np.sqrt(np.mean(samples[: n * frame].astype(np.float64).reshape(n, frame) ** 2, axis=1))
     silence = np.percentile(rms, SILENCE_PCT)
-    max_f, search_f = int(MAX_CHUNK_S / FRAME_S), int(SEARCH_S / FRAME_S)
-    chunks, start = [], 0
-    while start < n:
-        if n - start <= max_f:
-            end = n
+    loud = rms > silence * 2
+    min_run = int(round(MIN_RUN_S / FRAME_S))
+    gap = int(round(SPLIT_GAP_S / FRAME_S))
+    pad = int(round(PAD_S / FRAME_S))
+    min_speech = int(round(MIN_SPEECH_S / FRAME_S))
+
+    runs, i = [], 0
+    while i < n:
+        if loud[i]:
+            j = i
+            while j < n and loud[j]:
+                j += 1
+            if j - i >= min_run:
+                runs.append([i, j, j - i])
+            i = j
         else:
-            lo, hi = start + max_f - search_f, start + max_f
-            window = np.convolve(rms[lo:hi], np.ones(10) / 10, mode="same")
-            end = lo + int(np.argmin(window))
-        voiced = float(np.mean(rms[start:end] > silence * 2))
-        chunks.append({"start": start * FRAME_S, "end": end * FRAME_S, "voiced": voiced})
-        start = end
-    return [c for c in chunks if c["voiced"] >= MIN_VOICED]
+            i += 1
+
+    regions = []
+    for s0, e0, v in runs:
+        if regions and s0 - regions[-1][1] < gap:
+            regions[-1][1] = e0
+            regions[-1][2] += v
+        else:
+            regions.append([s0, e0, v])
+
+    chunks = []
+    for s0, e0, v in regions:
+        if v < min_speech:
+            continue
+        for a, b in _split_long(rms, max(0, s0 - pad), min(n, e0 + pad)):
+            voiced = float(np.mean(loud[a:b]))
+            if voiced >= MIN_VOICED:
+                chunks.append({"start": a * FRAME_S, "end": b * FRAME_S, "voiced": voiced})
+    return chunks
 
 
 def wav_bytes(samples: np.ndarray) -> bytes:
@@ -153,6 +227,8 @@ def _post(route: str, fields: dict, audio: bytes) -> dict:
             return json.loads(resp.read())
     except urllib.error.HTTPError as exc:
         detail = exc.read().decode("utf-8", "replace")[:300]
+        if "did not contain transcript text" in detail:
+            raise NoSpeech(detail) from exc
         raise RuntimeError(f"audio.cpp respondeu {exc.code} em {route}: {detail}") from exc
 
 
@@ -194,6 +270,44 @@ def attach_times(text: str, aligned: List[dict]) -> List[dict]:
     return out
 
 
+def collapse_loops(text: str) -> str:
+    """Corta repetições em laço ("vai vai vai vai vai" -> "vai vai").
+
+    Compara sem pontuação e sem caixa; a pontuação final da última repetição
+    é preservada ("sim, sim, sim, sim." -> "sim, sim.").
+    """
+    words = text.split()
+    keys = [_key(w) for w in words]
+    out, i = [], 0
+    while i < len(words):
+        best = None
+        for n in range(1, LOOP_MAX_UNIT + 1):
+            if i + n > len(words):
+                break
+            unit = keys[i:i + n]
+            if not any(unit):
+                continue
+            reps, j = 1, i + n
+            while keys[j:j + n] == unit:
+                reps += 1
+                j += n
+            if reps >= LOOP_MIN_REPS and (best is None or reps * n > best[0] * best[1]):
+                best = (n, reps)
+        if best is None:
+            out.append(words[i])
+            i += 1
+            continue
+        n, reps = best
+        kept = words[i:i + n * LOOP_KEEP]
+        last = words[i + n * reps - 1]
+        tail = last[len(last.rstrip(".,;:!?…»\"')]")):]
+        core = kept[-1].rstrip(".,;:!?…»\"')]")
+        kept[-1] = core + tail
+        out.extend(kept)
+        i += n * reps
+    return " ".join(out)
+
+
 def spread_times(text: str, start: float, end: float) -> List[dict]:
     """Sem alinhador para o idioma: distribui o bloco pelas palavras, pelo tamanho."""
     tokens = text.split()
@@ -231,23 +345,29 @@ class Engine:
         samples = decode(path)
         duration = len(samples) / RATE
         chunks = energy_chunks(samples)
-        lang = (language or "").strip().lower() or None
+        # "Portuguese" vira "pt": o alinhador e a conversão de números procuram o código.
+        lang = language_code(language)
 
         with self._lock:
             # 1a passada: transcrição de todos os blocos.
             for i, c in enumerate(chunks):
                 report("transcribing", TRANSCRIBE_SHARE * i / max(len(chunks), 1))
                 audio = wav_bytes(samples[int(c["start"] * RATE):int(c["end"] * RATE)])
-                res = _post("/v1/audio/transcriptions/details", {"model": ASR_MODEL, "language": lang}, audio)
-                c["language"] = (res.get("language") or lang or "").lower() or None
-                text = " ".join((res.get("text") or "").split())
+                try:
+                    res = _post("/v1/audio/transcriptions/details", {"model": ASR_MODEL, "language": lang}, audio)
+                except NoSpeech:
+                    # Bloco sem fala reconhecível: fica vazio, o arquivo segue.
+                    res = {"text": ""}
+                c["language"] = language_code(res.get("language") or lang)
+                text = collapse_loops(" ".join((res.get("text") or "").split()))
                 c["text"] = to_digits(text) if (c["language"] or "").startswith("pt") else text
                 c["audio"] = audio
 
             # 2a passada: instante de cada palavra.
             for i, c in enumerate(chunks):
                 report("aligning", TRANSCRIBE_SHARE + (1 - TRANSCRIBE_SHARE) * i / max(len(chunks), 1))
-                name = ALIGN_LANGUAGES.get((c["language"] or "")[:2]) if c["language"] else None
+                lang_c = c["language"] or ""
+                name = ALIGN_LANGUAGES.get(lang_c) or ALIGN_LANGUAGES.get(lang_c[:2])
                 c["aligned"] = False
                 if not c["text"]:
                     c["words"] = []

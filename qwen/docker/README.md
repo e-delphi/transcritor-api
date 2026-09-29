@@ -33,6 +33,18 @@ CPU — cerca de 10× mais devagar. Para essas máquinas, use a
 
 Sem placa nenhuma, as duas variantes caem sozinhas para a CPU em vez de parar.
 
+## Imagem pronta
+
+Publicada no Docker Hub, com motor e modelos dentro — não precisa fazer o build:
+
+```bash
+docker pull eduardo20041995/transcritor-api:qwen-vulkan   # AMD e Intel
+docker pull eduardo20041995/transcritor-api:qwen-cuda     # NVIDIA
+```
+
+Nos comandos de "Executar" abaixo, use `eduardo20041995/transcritor-api:qwen-vulkan`
+(ou `:qwen-cuda`) no lugar de `transcritor-api:qwen-vulkan`.
+
 ## Build
 
 ```bash

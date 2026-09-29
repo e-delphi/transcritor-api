@@ -44,6 +44,15 @@ Antes do primeiro build, uma vez:
 O token entra no build por `--secret`, que o monta apenas durante o passo de download.
 Ele **não fica gravado em nenhuma camada da imagem** e não aparece no histórico dela.
 
+## Imagem pronta
+
+Publicada no Docker Hub, com os modelos dentro — não precisa de token nem de build:
+
+```bash
+docker pull eduardo20041995/transcritor-api:whisper-cuda
+docker run -d --gpus all -p 8000:8000 -v transcritor-dados:/data eduardo20041995/transcritor-api:whisper-cuda
+```
+
 ## Build
 
 ```bash

@@ -1,0 +1,49 @@
+# WhisperX na GPU NVIDIA. Precisa do NVIDIA Container Toolkit (Linux) ou do
+# Docker Desktop com WSL2 (Windows).
+#
+#   HF_TOKEN_FILE=$HOME/hf_token.txt docker compose build
+#   docker compose up -d
+services:
+  transcritor-api:
+    build:
+      context: .
+      args:
+        # tiny | base | small | medium | large-v2 | large-v3
+        WHISPER_MODEL: ${WHISPER_MODEL:-large-v3}
+        # idiomas com alinhamento de palavras embutido
+        ALIGN_LANGUAGES: ${ALIGN_LANGUAGES:-pt,en}
+      # Token do HuggingFace usado apenas durante o build, para baixar o modelo
+      # de diarização. Não entra na imagem.
+      secrets:
+        - hf_token
+    image: transcritor-api:whisper-cuda
+    container_name: transcritor-api-cuda
+    ports:
+      - "8000:8000"
+    environment:
+      DEVICE: cuda
+      # float16 = nativo da GPU; int8 economiza memória de vídeo (placas de 6-8 GB)
+      COMPUTE_TYPE: float16
+      # Lote maior = mais rápido, até a memória de vídeo acabar
+      BATCH_SIZE: 16
+      MAX_UPLOAD_MB: 1024
+      # 6 horas: depois disso o áudio e a transcrição são apagados juntos.
+      JOB_TTL_SECONDS: 21600
+    volumes:
+      # Jobs e resultados sobrevivem ao reinício do container.
+      - transcritor-dados:/data
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    restart: unless-stopped
+
+secrets:
+  hf_token:
+    file: ${HF_TOKEN_FILE:-./hf_token.txt}
+
+volumes:
+  transcritor-dados:

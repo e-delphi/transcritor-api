@@ -1,0 +1,7 @@
+# Stack da API. O torch vem do índice CPU (ver Dockerfile) para manter a imagem
+# enxuta; o whisperx arrasta faster-whisper, ctranslate2, pyannote-audio e
+# transformers nas versões que ele mesmo suporta.
+fastapi==0.115.6
+uvicorn[standard]==0.32.1
+python-multipart==0.0.20
+whisperx==3.8.6

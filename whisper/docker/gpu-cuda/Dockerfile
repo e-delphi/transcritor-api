@@ -1,13 +1,16 @@
 # syntax=docker/dockerfile:1
 #
-# Imagem autocontida: modelos embutidos, nenhum download em runtime.
+# Variante GPU NVIDIA (CUDA) do WhisperX: transcrição, alinhamento e separação
+# de falantes na placa de vídeo. Imagem autocontida: modelos embutidos, nenhum
+# download em runtime. Precisa de placa NVIDIA e do NVIDIA Container Toolkit
+# (no Windows, o Docker Desktop já traz).
 #
 # O modelo de diarização do pyannote exige aceite de termos no HuggingFace, então
 # o BUILD precisa de um token. Ele entra por secret e não fica em nenhuma camada
 # da imagem; o container roda sem token e sem rede.
 #
-#   docker build --secret id=hf_token,src=$HOME/hf_token.txt -t transcritor-api .
-#   docker run -p 8000:8000 -v transcritor-dados:/data transcritor-api
+#   docker build --secret id=hf_token,src=$HOME/hf_token.txt -t transcritor-api:whisper-cuda .
+#   docker run --gpus all -p 8000:8000 -v transcritor-dados:/data transcritor-api:whisper-cuda
 #
 # Modelos disponíveis: tiny, base, small, medium, large-v2, large-v3.
 # O padrão é large-v3, o mais preciso. Para imagem menor e mais rápida:
@@ -38,22 +41,25 @@ RUN python -m venv /opt/venv
 
 COPY requirements.txt /tmp/requirements.txt
 
-# torch CPU-only: evita arrastar ~2 GB de bibliotecas CUDA que não seriam usadas.
+# torch com CUDA 12.8. As bibliotecas CUDA (cuDNN 9, cuBLAS...) vêm como pacotes
+# pip junto com ele — por isso a base segue python:slim, sem a imagem nvidia/cuda.
+# O driver (libcuda) vem da máquina, injetado pelo NVIDIA Container Toolkit.
 RUN pip install --no-cache-dir \
-        --index-url https://download.pytorch.org/whl/cpu \
+        --index-url https://download.pytorch.org/whl/cu128 \
         torch==2.8.0 torchaudio==2.8.0 torchvision==0.23.0 \
  && pip install --no-cache-dir -r /tmp/requirements.txt
 
 # Kernels com hardening (WSL2/Docker Desktop) recusam .so marcadas com stack
 # executável, o que quebra o carregamento da libctranslate2. Ver o script.
-COPY docker/fix_execstack.py /tmp/fix_execstack.py
+COPY scripts/fix_execstack.py /tmp/fix_execstack.py
 RUN python /tmp/fix_execstack.py /opt/venv
 
-# Falha o build (em vez do runtime) se alguma extensão nativa não carregar.
+# Falha o build (em vez do runtime) se alguma extensão nativa não carregar. Não
+# precisa de GPU: só carrega as bibliotecas, não as usa.
 RUN python -c "import whisperx, torch, torchaudio, ctranslate2, pyannote.audio; print('imports ok')"
 
 # Modelos gravados na imagem. O token só existe durante este RUN.
-COPY docker/download_models.py /tmp/download_models.py
+COPY scripts/download_models.py /tmp/download_models.py
 RUN --mount=type=secret,id=hf_token \
     WHISPER_MODEL=${WHISPER_MODEL} ALIGN_LANGUAGES=${ALIGN_LANGUAGES} \
     NLTK_DATA=/models/nltk python /tmp/download_models.py
@@ -61,6 +67,7 @@ RUN --mount=type=secret,id=hf_token \
 # --------------------------------------------------------------- runtime ----
 FROM python:${PYTHON_VERSION}-slim AS runtime
 
+ARG PYTHON_VERSION
 ARG WHISPER_MODEL=large-v3
 ARG ALIGN_LANGUAGES=pt,en
 
@@ -82,11 +89,22 @@ ENV VIRTUAL_ENV=/opt/venv \
     HF_HUB_CACHE=/models/hf \
     TORCH_HOME=/models/torch \
     NLTK_DATA=/models/nltk \
-    DEVICE=cpu \
-    COMPUTE_TYPE=int8 \
+    DEVICE=cuda \
+    # float16 é o tipo nativo da GPU; int8 economiza memória de vídeo (placas de
+    # 6-8 GB) com pouca perda.
+    COMPUTE_TYPE=float16 \
     CPU_THREADS=8 \
     OMP_NUM_THREADS=8 \
-    BATCH_SIZE=8 \
+    # Trechos transcritos por vez. Na GPU, lote maior = mais rápido, até a
+    # memória de vídeo acabar; 16 cabe folgado em 8 GB com large-v3.
+    BATCH_SIZE=16 \
+    # O faster-whisper (CTranslate2) procura libcudnn.so.9 e libcublas.so.12 no
+    # sistema; aqui elas estão dentro dos pacotes pip que o torch trouxe.
+    LD_LIBRARY_PATH=/opt/venv/lib/python${PYTHON_VERSION}/site-packages/nvidia/cudnn/lib:/opt/venv/lib/python${PYTHON_VERSION}/site-packages/nvidia/cublas/lib \
+    # Pedem ao NVIDIA Container Toolkit o driver de cálculo (a base não é a
+    # nvidia/cuda, que já traz isto).
+    NVIDIA_VISIBLE_DEVICES=all \
+    NVIDIA_DRIVER_CAPABILITIES=compute,utility \
     MAX_UPLOAD_MB=1024 \
     JOBS_DIR=/data/jobs \
     JOB_TTL_SECONDS=21600 \

@@ -7,7 +7,11 @@ Qwen3-ForcedAligner, servidos pelo [audio.cpp](https://github.com/0xShug0/audio.
 O foco é o **instante de cada palavra**: nos testes, o início das palavras errou ~22 ms
 na mediana, e ~98% ficaram a menos de 100 ms. Uma reunião de 88 min leva cerca de 7 min
 numa RX 9070 XT. Não há separação por falante — para isso, use o
-[projeto Docker](../README.md), na raiz deste repositório, que é independente deste.
+projeto WhisperX em Docker ([CPU](../../whisper/docker/cpu/README.md) ou
+[GPU NVIDIA](../../whisper/docker/gpu-cuda/README.md)), que é independente deste.
+
+O mesmo motor também roda num container com GPU — Linux com AMD ou Intel, ou qualquer
+máquina com NVIDIA —, no projeto [Qwen Docker](../docker/README.md).
 
 ## Como funciona
 
@@ -45,7 +49,7 @@ Tudo fica em `%LOCALAPPDATA%\TranscritorAPI`:
 | `data\jobs\` | Áudios e transcrições da fila |
 | `logs\` | Registros do audio.cpp |
 
-O código da API não é copiado: ele roda desta pasta (`windows\app`), cujo caminho fica
+O código da API não é copiado: ele roda desta pasta (`qwen\windows\app`), cujo caminho fica
 gravado em `repo.txt`. Se mover o repositório, rode `instalar.bat` de novo. Rodar de
 novo é sempre seguro — o que já está instalado só é conferido.
 
@@ -178,7 +182,7 @@ O `iniciar.bat` já define as necessárias; estas servem para ajuste fino.
 
 ## Licença
 
-GPL-3.0 ou posterior — veja o [LICENSE](../LICENSE) na raiz do repositório.
+GPL-3.0 ou posterior — veja o [LICENSE](../../LICENSE) na raiz do repositório.
 As dependências têm licenças próprias, todas compatíveis com a GPLv3:
 
 | Componente | Licença |

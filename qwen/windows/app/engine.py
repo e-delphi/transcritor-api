@@ -8,8 +8,9 @@ Qwen3-ForcedAligner errou o início das palavras em ~20 ms (mediana), contra ~65
 do wav2vec2, e roda na GPU por Vulkan, inclusive em placas AMD.
 
 Fluxo:
-1. o áudio é cortado em blocos de até BLOCO_MAX_SEGUNDOS nos trechos mais
-   silenciosos; blocos só de silêncio são descartados;
+1. só as regiões com fala vão para o modelo (ruído e silêncio longo viram texto
+   inventado), em blocos de até BLOCO_MAX_SEGUNDOS cortados nos trechos mais
+   silenciosos;
 2. o Qwen3-ASR transcreve cada bloco;
 3. em português, números por extenso viram algarismos (ver numbers_pt);
 4. o Qwen3-ForcedAligner marca o instante de cada palavra do texto.

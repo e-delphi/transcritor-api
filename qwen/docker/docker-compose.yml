@@ -1,0 +1,60 @@
+# Transcritor API — Qwen. Escolha a variante pelo perfil:
+#
+#   AMD / Intel no Linux:
+#     RENDER_GID=$(stat -c %g /dev/dri/renderD128) docker compose --profile vulkan up -d
+#   NVIDIA (Linux, ou Windows com Docker Desktop):
+#     docker compose --profile cuda up -d
+#
+# GET /health diz o backend em uso ("vulkan", "cuda" ou "cpu" se a placa não
+# chegou ao container).
+
+x-comum: &comum
+  ports:
+    - "8000:8000"
+  environment:
+    # auto | vulkan | cuda | cpu
+    QWEN_BACKEND: auto
+    # 2 = os dois modelos na memória (mais rápido); 1 = um de cada vez, para
+    # placas com pouca memória (~2,5 GB em vez de ~3,6 GB).
+    QWEN_MAX_MODELS: 2
+    JOB_TTL_SECONDS: 21600
+    MAX_UPLOAD_MB: 1024
+  volumes:
+    - qwen-dados:/data
+  restart: unless-stopped
+
+services:
+  qwen-vulkan:
+    <<: *comum
+    profiles: ["vulkan"]
+    build:
+      context: .
+      args:
+        VARIANT: vulkan
+    image: transcritor-api:qwen-vulkan
+    container_name: transcritor-qwen
+    devices:
+      - /dev/dri:/dev/dri
+    # O grupo que dá acesso à placa tem o NÚMERO da máquina, não o do container.
+    group_add:
+      - "${RENDER_GID:-video}"
+
+  qwen-cuda:
+    <<: *comum
+    profiles: ["cuda"]
+    build:
+      context: .
+      args:
+        VARIANT: cuda
+    image: transcritor-api:qwen-cuda
+    container_name: transcritor-qwen
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+volumes:
+  qwen-dados:

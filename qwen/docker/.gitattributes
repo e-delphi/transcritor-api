@@ -1,0 +1,4 @@
+# Scripts do container: LF sempre, mesmo com autocrlf no Windows (um .sh com
+# CRLF quebra no Linux com "/bin/sh^M: bad interpreter").
+*.sh text eol=lf
+Dockerfile text eol=lf
